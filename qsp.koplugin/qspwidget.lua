@@ -28,7 +28,8 @@ ffi.cdef[[
 
     typedef struct { QSP_CHAR *Str; QSP_CHAR *End; } QSPString;
     typedef struct { QSPString Name; QSPString Image; } QSPListItem;
-    typedef struct { QSPString Name; QSPString Desc; } QSPObjectItem;
+    typedef struct { QSPString Name; QSPString Title; QSPString Image; } QSPObjectItem;
+    typedef struct { int LineNum; QSPString Line; } QSPLineInfo;
 
     void QSPInit(void);
     void QSPTerminate(void);
@@ -42,6 +43,7 @@ ffi.cdef[[
     int QSPGetObjects(QSPObjectItem *items, int itemsBufSize);
     QSP_BOOL QSPSetSelObjectIndex(int ind, QSP_BOOL toRefreshUI);
     int QSPGetSelObjectIndex(void);
+    int QSPGetActionCode(int actionIndex, QSPLineInfo *lines, int linesBufSize);
 ]]
 
 -- UTF-32 → UTF-8
@@ -78,7 +80,6 @@ local function qspStringToUtf8(qsp_str)
     return table.concat(result)
 end
 
--- Создать QSPString из ASCII C-строки
 local function makeQSPString(s)
     local buf = ffi.new("int[?]", #s + 1)
     for i = 1, #s do
@@ -88,7 +89,6 @@ local function makeQSPString(s)
     return ffi.new("QSPString", buf, buf + #s)
 end
 
--- Директория плагина
 local function getPluginDir()
     local info = debug.getinfo(1, "S")
     local source = info.source
@@ -96,7 +96,6 @@ local function getPluginDir()
     return path:match("(.+)/[^/]+$")
 end
 
--- Загрузка libqsp.so
 local function loadQSPLib()
     local plugin_dir = getPluginDir()
     local candidates = {
@@ -131,6 +130,8 @@ local QSPWidget = InputContainer:extend{
     desc_html = "",
     actions = {},
     objects = {},
+    font_size = 20,
+    html_widget = nil,
 }
 
 function QSPWidget:init()
@@ -171,16 +172,6 @@ function QSPWidget:init()
     self.loaded = true
     self:updateState()
     self:buildLayout()
-
-    -- Жест "swipe down" для закрытия
-    self.ges_events = {
-        SwipeDown = {
-            GestureRange:new{
-                ges = "swipe",
-                range = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() },
-            },
-        },
-    }
 end
 
 function QSPWidget:updateState()
@@ -192,10 +183,41 @@ function QSPWidget:updateState()
     local items = ffi.new("QSPListItem[?]", 100)
     local count = self.lib.QSPGetActions(items, 100)
     for i = 0, count - 1 do
-        self.actions[#self.actions + 1] = {
-            name = qspStringToUtf8(items[i].Name),
-            index = i,
-        }
+        -- Проверяем активность действия через QSPGetActionCode.
+        -- Если код действия пуст или состоит из одной строки "ACT" —
+        -- действие считается неактивным и не показывается.
+        local lines = ffi.new("QSPLineInfo[?]", 100)
+        local n_lines = self.lib.QSPGetActionCode(i, lines, 100)
+
+        local is_active = false
+        if n_lines > 0 then
+            is_active = true
+            -- Смотрим первую строку кода
+            local first_line = qspStringToUtf8(lines[0].Line)
+            -- Убираем пробелы по краям
+            local trimmed = first_line:gsub("^%s+", ""):gsub("%s+$", "")
+            -- Если строка — "ACT" (в любом регистре), действие неактивно
+            if trimmed == "ACT" or trimmed == "act" then
+                is_active = false
+            end
+            logger.dbg("QSP: action", i,
+                "name=", qspStringToUtf8(items[i].Name),
+                "lines=", n_lines,
+                "first_line=[", trimmed, "]",
+                "active=", is_active)
+        else
+            logger.dbg("QSP: action", i,
+                "name=", qspStringToUtf8(items[i].Name),
+                "lines=", n_lines,
+                "active=false")
+        end
+
+        if is_active then
+            self.actions[#self.actions + 1] = {
+                name = qspStringToUtf8(items[i].Name),
+                index = i,
+            }
+        end
     end
 
     self.objects = {}
@@ -219,16 +241,42 @@ function QSPWidget:rebuild()
 end
 
 function QSPWidget:buildLayout()
+    -- Освобождаем старый HTML-виджет, если он есть (защита от утечки памяти)
+    if self.html_widget and self.html_widget.free then
+        self.html_widget:free()
+        self.html_widget = nil
+    end
+
     local screen_w = Screen:getWidth()
     local screen_h = Screen:getHeight()
     local margin = Size.margin.default
     local content_w = screen_w - 2 * margin
 
-    -- === 1. Заголовок + кнопка закрытия ===
+    -- === Заголовок: название + A- + A+ + X ===
     local title_text = TextWidget:new{
         text = self.file:match("([^/]+)$") or self.file,
         face = Font:getFace("cfont", 16),
-        max_width = content_w - 60,
+        max_width = content_w - 160,
+    }
+
+    local font_down_btn = Button:new{
+        text = "A-",
+        text_font_face = "cfont",
+        text_font_size = 16,
+        margin = Size.margin.tiny,
+        callback = function()
+            self:onFontSizeChange(-2)
+        end,
+    }
+
+    local font_up_btn = Button:new{
+        text = "A+",
+        text_font_face = "cfont",
+        text_font_size = 16,
+        margin = Size.margin.tiny,
+        callback = function()
+            self:onFontSizeChange(2)
+        end,
     }
 
     local close_btn = Button:new{
@@ -245,16 +293,20 @@ function QSPWidget:buildLayout()
         align = "center",
         title_text,
         HorizontalSpan:new{ width = 10 },
+        font_down_btn,
+        HorizontalSpan:new{ width = 3 },
+        font_up_btn,
+        HorizontalSpan:new{ width = 3 },
         close_btn,
     }
 
-    -- === 2. HTML-текст игры (фиксированная высота) ===
+    -- === HTML-текст игры ===
     local dir = self.file:match("(.+)/[^/]+$") or "."
     local html_h = math.floor(screen_h * 0.45)
 
-    local html_widget = ScrollHtmlWidget:new{
+    self.html_widget = ScrollHtmlWidget:new{
         html_body = self.desc_html,
-        default_font_size = 20,
+        default_font_size = self.font_size,
         html_resource_directory = dir,
         html_link_tapped_callback = function(link)
             self:onLinkTap(link)
@@ -264,7 +316,7 @@ function QSPWidget:buildLayout()
         height = html_h,
     }
 
-    -- === 3. Панель объектов ===
+    -- === Панель объектов ===
     local objects_hg = nil
     if #self.objects > 0 then
         local objs_children = {}
@@ -283,7 +335,7 @@ function QSPWidget:buildLayout()
         objects_hg = HorizontalGroup:new(objs_children)
     end
 
-    -- === 4. Кнопки действий ===
+    -- === Кнопки действий (только активные) ===
     local actions_children = { align = "left" }
     for _, action in ipairs(self.actions) do
         table.insert(actions_children, Button:new{
@@ -299,12 +351,12 @@ function QSPWidget:buildLayout()
     end
     local actions_group = VerticalGroup:new(actions_children)
 
-    -- === 5. Собираем контент ===
+    -- === Собираем контент ===
     local children = {
         align = "center",
         title_bar,
         VerticalSpan:new{ width = 10 },
-        html_widget,
+        self.html_widget,
         VerticalSpan:new{ width = 10 },
     }
     if objects_hg then
@@ -315,7 +367,7 @@ function QSPWidget:buildLayout()
 
     local vertical = VerticalGroup:new(children)
 
-    -- === 6. Оборачиваем в ScrollableContainer ===
+    -- === ScrollableContainer ===
     local scrollable = ScrollableContainer:new{
         dimen = Geom:new{
             w = content_w,
@@ -324,7 +376,7 @@ function QSPWidget:buildLayout()
         vertical,
     }
 
-    -- === 7. FrameContainer ===
+    -- === FrameContainer ===
     local frame = FrameContainer:new{
         margin = margin,
         padding = Size.padding.default,
@@ -332,7 +384,7 @@ function QSPWidget:buildLayout()
         scrollable,
     }
 
-    -- === 8. CenterContainer ===
+    -- === CenterContainer ===
     local center = CenterContainer:new{
         dimen = Geom:new{ w = screen_w, h = screen_h },
         frame,
@@ -340,6 +392,19 @@ function QSPWidget:buildLayout()
 
     self[1] = center
     self.dimen = Geom:new{ x = 0, y = 0, w = screen_w, h = screen_h }
+end
+
+function QSPWidget:onFontSizeChange(delta)
+    local new_size = self.font_size + delta
+    if new_size < 12 then new_size = 12 end
+    if new_size > 40 then new_size = 40 end
+    if new_size == self.font_size then return true end
+
+    self.font_size = new_size
+    logger.dbg("QSP: font size changed to", self.font_size)
+
+    self:rebuild()
+    return true
 end
 
 function QSPWidget:onLinkTap(link)
@@ -381,8 +446,11 @@ function QSPWidget:onObjectTap(index)
     return true
 end
 
-function QSPWidget:onSwipeDown()
-    self:onClose()
+-- Поглощаем свайпы, чтобы UIManager не закрыл виджет.
+-- ScrollableContainer обрабатывает свои свайпы раньше нас,
+-- поэтому сюда попадают только "лишние" свайпы.
+function QSPWidget:onSwipe(arg, ges)
+    logger.dbg("QSP: onSwipe ignored:", ges.direction)
     return true
 end
 
@@ -395,6 +463,11 @@ function QSPWidget:onCloseWidget()
     if self.lib and self.loaded then
         self.lib.QSPTerminate()
         self.loaded = false
+    end
+
+    if self.html_widget and self.html_widget.free then
+        self.html_widget:free()
+        self.html_widget = nil
     end
 end
 
