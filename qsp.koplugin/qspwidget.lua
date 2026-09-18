@@ -17,11 +17,10 @@ local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local ffi = require("ffi")
-local logger = require("logger")
 local _ = require("gettext")
 local Screen = Device.screen
 
--- FFI: API libqsp (QSP_CHAR = int = 4 байта, UTF-32!)
+-- FFI: API libqsp (QSP_CHAR = int = 4 байта, UTF-32)
 ffi.cdef[[
     typedef int QSP_CHAR;
     typedef int QSP_BOOL;
@@ -129,7 +128,7 @@ local QSPWidget = InputContainer:extend{
     desc_html = "",
     actions = {},
     objects = {},
-    font_size = 28,
+    font_size = 26,
     html_widget = nil,
 }
 
@@ -170,7 +169,6 @@ function QSPWidget:init()
     self:updateState()
     self:buildLayout()
 
-    -- Поглощаем свайпы, чтобы UIManager не закрыл виджет
     self.ges_events = {
         SwipeIgnore = {
             GestureRange:new{
@@ -189,6 +187,7 @@ function QSPWidget:updateState()
     self.actions = {}
     local items = ffi.new("QSPListItem[?]", 100)
     local count = self.lib.QSPGetActions(items, 100)
+
     for i = 0, count - 1 do
         local name = qspStringToUtf8(items[i].Name)
         local is_active = true
@@ -229,13 +228,11 @@ function QSPWidget:updateState()
 end
 
 function QSPWidget:rebuild()
-    -- Освобождаем старый HTML-виджет (защита от утечки памяти)
     if self.html_widget and self.html_widget.free then
         self.html_widget:free()
         self.html_widget = nil
     end
 
-    -- Очищаем старый контейнер (освобождает дочерние виджеты)
     if self[1] then
         if self[1].clear then
             self[1]:clear()
@@ -253,20 +250,22 @@ end
 function QSPWidget:buildLayout()
     local screen_w = Screen:getWidth()
     local screen_h = Screen:getHeight()
-    -- Минимальные отступы, чтобы текст занимал всю ширину
-    local outer_margin = Size.margin.small
 
-    -- === Заголовок: название + A- + A+ + ✕ (прижаты вправо) ===
+    -- Минимальные отступы для расширения поля текста
+    local h_margin = Size.margin.tiny
+    local content_w = screen_w - 2 * h_margin
+
+    -- === Заголовок: название + A- + A+ + ✕ ===
     local title_text = TextWidget:new{
         text = self.file:match("([^/]+)$") or self.file,
         face = Font:getFace("cfont", 16),
-        max_width = screen_w - 200,
+        max_width = content_w - 180,
     }
 
     local font_down_btn = Button:new{
         text = "A-",
         text_font_face = "cfont",
-        text_font_size = 18,
+        text_font_size = 16,
         margin = Size.margin.tiny,
         callback = function()
             self:onFontSizeChange(-2)
@@ -276,7 +275,7 @@ function QSPWidget:buildLayout()
     local font_up_btn = Button:new{
         text = "A+",
         text_font_face = "cfont",
-        text_font_size = 18,
+        text_font_size = 16,
         margin = Size.margin.tiny,
         callback = function()
             self:onFontSizeChange(2)
@@ -304,9 +303,9 @@ function QSPWidget:buildLayout()
         close_btn,
     }
 
-    -- === HTML-текст игры (широкое поле) ===
+    -- === HTML-текст игры ===
     local dir = self.file:match("(.+)/[^/]+$") or "."
-    local html_h = math.floor(screen_h * 0.5)
+    local html_h = math.floor(screen_h * 0.55)
 
     self.html_widget = ScrollHtmlWidget:new{
         html_body = self.desc_html,
@@ -316,7 +315,7 @@ function QSPWidget:buildLayout()
             self:onLinkTap(link)
         end,
         dialog = self,
-        width = screen_w - 2 * outer_margin,
+        width = content_w,
         height = html_h,
     }
 
@@ -339,14 +338,14 @@ function QSPWidget:buildLayout()
         objects_hg = HorizontalGroup:new(objs_children)
     end
 
-    -- === Кнопки действий (только активные) ===
+    -- === Кнопки действий ===
     local actions_children = { align = "left" }
     for _, action in ipairs(self.actions) do
         table.insert(actions_children, Button:new{
             text = action.name,
             text_font_face = "cfont",
             text_font_size = 18,
-            width = screen_w - 2 * outer_margin,
+            width = content_w,
             margin = Size.margin.small,
             callback = function()
                 self:onActionTap(action.index)
@@ -355,40 +354,37 @@ function QSPWidget:buildLayout()
     end
     local actions_group = VerticalGroup:new(actions_children)
 
-    -- === Собираем контент ===
+    -- === Контент ===
     local children = {
         align = "center",
         title_bar,
-        VerticalSpan:new{ width = 10 },
+        VerticalSpan:new{ width = 6 },
         self.html_widget,
-        VerticalSpan:new{ width = 10 },
+        VerticalSpan:new{ width = 6 },
     }
     if objects_hg then
         table.insert(children, objects_hg)
-        table.insert(children, VerticalSpan:new{ width = 5 })
+        table.insert(children, VerticalSpan:new{ width = 4 })
     end
     table.insert(children, actions_group)
 
     local vertical = VerticalGroup:new(children)
 
-    -- === ScrollableContainer (почти во весь экран) ===
     local scrollable = ScrollableContainer:new{
         dimen = Geom:new{
-            w = screen_w - 2 * outer_margin,
-            h = screen_h - 2 * outer_margin,
+            w = content_w,
+            h = math.floor(screen_h * 0.9),
         },
         vertical,
     }
 
-    -- === FrameContainer (минимальные отступы) ===
     local frame = FrameContainer:new{
         margin = 0,
-        padding = outer_margin,
+        padding = Size.padding.small,
         bordersize = 0,
         scrollable,
     }
 
-    -- === Занимает весь экран ===
     local center = CenterContainer:new{
         dimen = Geom:new{ w = screen_w, h = screen_h },
         frame,
@@ -400,7 +396,7 @@ end
 
 function QSPWidget:onFontSizeChange(delta)
     local new_size = self.font_size + delta
-    if new_size < 12 then new_size = 12 end
+    if new_size < 14 then new_size = 14 end
     if new_size > 48 then new_size = 48 end
     if new_size == self.font_size then return true end
 
@@ -416,10 +412,13 @@ function QSPWidget:onLinkTap(link)
     uri = uri:gsub("&gt;", ">"):gsub("&lt;", "<"):gsub("&amp;", "&"):gsub("&quot;", '"')
 
     local qsp_cmd = uri:match("^EXEC:(.*)$") or uri
+
     local cmd = makeQSPString(qsp_cmd)
     local ok = self.lib.QSPExecString(cmd, 1)
     if not ok then
-        logger.warn("QSP: QSPExecString failed for:", qsp_cmd)
+        UIManager:show(InfoMessage:new{
+            text = _("Ошибка выполнения: ") .. qsp_cmd,
+        })
     end
 
     self:rebuild()
@@ -444,7 +443,6 @@ function QSPWidget:onObjectTap(index)
     return true
 end
 
--- Поглощаем свайпы, чтобы UIManager не закрыл виджет
 function QSPWidget:onSwipeIgnore(arg, ges)
     return true
 end
